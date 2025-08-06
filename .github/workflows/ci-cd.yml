@@ -1,0 +1,280 @@
+# GitHub Actions CI/CD for ProjectWE Infrastructure
+name: Infrastructure CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'terraform/**'
+      - 'kubernetes/**'
+      - 'docker/**'
+      - '.github/workflows/infrastructure.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - 'kubernetes/**'
+      - 'docker/**'
+
+env:
+  TERRAFORM_VERSION: '1.6.0'
+  KUBECTL_VERSION: '1.28.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  # Validate Terraform
+  terraform-validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive terraform/
+        
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: |
+          terraform init -backend=false
+          
+      - name: Terraform Validate
+        working-directory: ./terraform
+        run: terraform validate
+        
+      - name: TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: latest
+          
+      - name: Run TFLint
+        run: |
+          tflint --init
+          tflint --recursive
+
+  # Validate Kubernetes
+  kubernetes-validate:
+    name: Validate Kubernetes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+          
+      - name: Setup Kubeval
+        run: |
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin
+          
+      - name: Validate Kubernetes manifests
+        run: |
+          find kubernetes/ -name '*.yaml' -o -name '*.yml' | xargs kubeval --strict
+          
+      - name: Setup Kubesec
+        run: |
+          wget https://github.com/controlplaneio/kubesec/releases/download/v2.13.0/kubesec_linux_amd64.tar.gz
+          tar xf kubesec_linux_amd64.tar.gz
+          sudo mv kubesec /usr/local/bin
+          
+      - name: Security scan Kubernetes manifests
+        run: |
+          find kubernetes/ -name '*.yaml' -o -name '*.yml' | while read file; do
+            echo "Scanning $file"
+            kubesec scan $file
+          done
+
+  # Security Scanning
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Trivy scanner on Dockerfiles
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: './docker'
+          format: 'sarif'
+          output: 'trivy-docker-results.sarif'
+          
+      - name: Run Trivy scanner on Kubernetes
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: './kubernetes'
+          format: 'sarif'
+          output: 'trivy-k8s-results.sarif'
+          
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-docker-results.sarif'
+          
+      - name: Checkov Security Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: terraform,kubernetes,dockerfile
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          
+      - name: Upload Checkov results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+
+  # Terraform Plan
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [terraform-validate]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+        
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./terraform
+        run: |
+          terraform plan -no-color -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+          
+      - name: Comment Terraform Plan
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('terraform/plan.txt', 'utf8');
+            const output = `#### Terraform Plan 📖
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+            
+            </details>
+            
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+  # Deploy Infrastructure (Production)
+  deploy-production:
+    name: Deploy Infrastructure to Production
+    runs-on: ubuntu-latest
+    needs: [terraform-validate, kubernetes-validate, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment:
+      name: production
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          
+      - name: Terraform Init
+        working-directory: ./terraform
+        run: terraform init
+        
+      - name: Terraform Apply
+        working-directory: ./terraform
+        run: terraform apply -auto-approve
+        
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: ${{ env.KUBECTL_VERSION }}
+          
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name projectwe-production
+          
+      - name: Deploy Kubernetes manifests
+        run: |
+          kubectl apply -f kubernetes/namespaces/
+          kubectl apply -f kubernetes/configs/
+          kubectl apply -f kubernetes/services/
+          kubectl apply -f kubernetes/deployments/
+          kubectl apply -f kubernetes/ingress/
+          
+      - name: Wait for deployments
+        run: |
+          kubectl wait --for=condition=available --timeout=600s \
+            deployment --all -n projectwe
+            
+      - name: Run smoke tests
+        run: |
+          kubectl run smoke-test --image=curlimages/curl --rm -it --restart=Never -- \
+            curl -f http://intelligence-service.projectwe.svc.cluster.local/health
+
+  # Deploy Infrastructure (Staging)
+  deploy-staging:
+    name: Deploy Infrastructure to Staging
+    runs-on: ubuntu-latest
+    needs: [terraform-validate, kubernetes-validate]
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    environment:
+      name: staging
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+          
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          
+      - name: Terraform Init
+        working-directory: ./terraform/staging
+        run: terraform init
+        
+      - name: Terraform Apply
+        working-directory: ./terraform/staging
+        run: terraform apply -auto-approve -var="environment=staging"
